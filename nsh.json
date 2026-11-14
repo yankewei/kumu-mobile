@@ -1,0 +1,14 @@
+{
+  "name": "Kumu",
+  "id": "com.yankewei.kumu.mobile",
+  "version": "0.1.0",
+  "build": 1,
+  "appearance": "system",
+  "rust": ".",
+  "root": "App",
+  "ios": {
+    "infoPlist": {
+      "NSLocalNetworkUsageDescription": "Kumu connects to your Mac to show your coding agents' terminals."
+    }
+  }
+}
