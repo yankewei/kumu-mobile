@@ -50,7 +50,7 @@ SIMCTL_CHILD_KUMU_AUTOLINK='kumu://pair/...' \
   `channel | kind | length | payload`。
 - 终端 kind：DATA / CREDIT / CLOSE / RESIZE / REPLAY。
 - attach 在 Mac 的终端 session 线程上原子完成：resize → 快照 → ANSI 重放 →
-  实时字节。
+  实时字节。重放带最近 1000 行 scrollback，手机可以直接往回滚。
 - 手机在第一次布局后把真实 cols/rows 用于 attach，避免按 80 列重放后换行。
 
 ## 当前 UI
@@ -60,7 +60,10 @@ SIMCTL_CHILD_KUMU_AUTOLINK='kumu://pair/...' \
 - 操作菜单：在桌面显示、新建终端、新建 Agent（已安装列表）、字号 +/−、关闭窗格（确认）、断开连接。新建终端/Agent 成功后会刷新列表并切到新窗格；关闭后会切到 Mac 聚焦的窗格。
 - 操作失败会在按键区上方短暂提示（4 秒），点一下可提前关闭；终端布局不变，不会触发 PTY resize。
 - 字号会持久化，同时调整终端字号和行高。
-- 终端：两行按键区，第一行控制键（含粘滞 Ctrl/Alt），第二行方向键和常用符号；键盘 inset 和底部安全区分别处理。
+- 终端：两行按键区，第一行控制键（含粘滞 Ctrl/Alt），第二行方向键和常用符号；
+  全屏 TUI（OpenCode、vim 等，alternate screen）会多一行 PgUp/PgDn，用来滚动程序自己的内容；
+  程序开启鼠标报告时（OpenCode 默认开启），上下拖动会转成滚轮，轻点会转成鼠标左键点击（可点 tab、按钮）；
+  键盘 inset 和底部安全区分别处理。
 - 调试：`KUMU_AUTO_SHEET=1` 或 `KUMU_AUTO_MENU=1` 启动时直接打开对应面板。
 
 ## 当前限制
@@ -68,7 +71,8 @@ SIMCTL_CHILD_KUMU_AUTOLINK='kumu://pair/...' \
 - 粘滞 Ctrl/Alt 只作用于单字符输入，多字符粘贴和 IME 不转换。
 - Token 存在 NSH `Storage`，不是 Keychain。
 - 没有心跳重连 UI；网络断开后回连接页重新连接。
-- 终端查询应答重复、scrollback 不同步仍需实测。
+- 终端查询应答重复仍需实测；attach 只带最近 1000 行 scrollback，更早的历史留在 Mac。
+- 全屏 TUI（OpenCode、vim 等）在 alternate screen 上没有终端 scrollback。程序开启鼠标报告时拖动会转成滚轮、轻点会转成左键；没开时只能点 PgUp/PgDn 滚动程序自己的内容。
 - 后台/锁屏会断开，回前台重新 attach。
 
 ## 检查

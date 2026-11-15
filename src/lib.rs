@@ -65,7 +65,7 @@ fn drawer_rows(panes: &[PaneSummary], collapsed: &[i64]) -> Vec<DrawerRow> {
 /// The app's UI set (`nsh.json` `"rust"`).
 #[native_module("kumu-mobile/native")]
 fn native(registry: &mut Registry) {
-    registry.register::<App>();
+    registry.register::<App>().assets(assets!());
 }
 
 /// The app's root view: pairing, then the full-screen terminal.
@@ -204,6 +204,283 @@ fn field_label(label: &'static str) -> impl IntoElement {
         .text_color(move || theme().muted_foreground)
 }
 
+/// How a program asks for pointer events. A full-screen program with mouse
+/// capture on (OpenCode, vim with `mouse=a`, less with the mouse on) scrolls
+/// on a wheel, and the phone has no wheel: its drags become wheel notches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MouseEncoding {
+    /// The program did not ask for pointer events.
+    #[default]
+    Off,
+    /// X10's `ESC [ M Cb Cx Cy` (modes 1000-1003 without 1006).
+    X10,
+    /// SGR's `ESC [ < b ; x ; y M` (mode 1006).
+    Sgr,
+}
+
+/// Follows the alternate-screen and mouse-mode switches in a terminal's
+/// output. A program that draws on the alternate screen (OpenCode, vim,
+/// less) has no scrollback: the terminal cannot scroll its history, so the
+/// program must scroll its own view.
+#[derive(Default)]
+struct ScreenMode {
+    alternate: bool,
+    /// Modes 1000, 1002 or 1003: the program takes pointer events.
+    tracking: bool,
+    /// Mode 1006: pixel-free SGR coordinates for those events.
+    sgr: bool,
+    /// The escape sequence being read, so one split across network chunks
+    /// still counts. At most `ESC [ ?` and a short parameter list.
+    sequence: Vec<u8>,
+}
+
+impl ScreenMode {
+    fn mouse(&self) -> MouseEncoding {
+        match (self.tracking, self.sgr) {
+            (false, _) => MouseEncoding::Off,
+            (true, true) => MouseEncoding::Sgr,
+            (true, false) => MouseEncoding::X10,
+        }
+    }
+
+    /// Consumes `bytes`, returning the new state when it changed.
+    fn push(&mut self, bytes: &[u8]) -> Option<(bool, MouseEncoding)> {
+        let before = (self.alternate, self.mouse());
+        for &byte in bytes {
+            self.consume(byte);
+        }
+        let after = (self.alternate, self.mouse());
+        (after != before).then_some(after)
+    }
+
+    fn consume(&mut self, byte: u8) {
+        match self.sequence.len() {
+            0 => {
+                if byte == 0x1b {
+                    self.sequence.push(byte);
+                }
+            }
+            1 => match byte {
+                b'[' => self.sequence.push(byte),
+                _ => self.sequence.clear(),
+            },
+            2 => match byte {
+                // Private modes only; other control sequences are not ours.
+                b'?' => self.sequence.push(byte),
+                _ => self.sequence.clear(),
+            },
+            _ => match byte {
+                b'0'..=b'9' | b';' if self.sequence.len() < 32 => self.sequence.push(byte),
+                b'h' | b'l' => {
+                    self.apply(byte == b'h');
+                    self.sequence.clear();
+                }
+                _ => self.sequence.clear(),
+            },
+        }
+    }
+
+    fn apply(&mut self, set: bool) {
+        let params = self.sequence[3..]
+            .split(|byte| *byte == b';')
+            .filter_map(|param| std::str::from_utf8(param).ok()?.parse::<u16>().ok());
+        for mode in params {
+            match mode {
+                47 | 1047 | 1049 => self.alternate = set,
+                1000 | 1002 | 1003 => self.tracking = set,
+                1006 => self.sgr = set,
+                _ => {}
+            }
+        }
+    }
+
+    /// Forgets the stream after a reset (`ESC c`), reporting the modes that
+    /// were on.
+    fn reset(&mut self) -> (bool, MouseEncoding) {
+        self.sequence.clear();
+        let mouse = self.mouse();
+        self.tracking = false;
+        self.sgr = false;
+        (std::mem::take(&mut self.alternate), mouse)
+    }
+}
+
+/// How far a finger travels for one wheel notch, in points. A notch scrolls
+/// a few lines in the program, so a full-screen swipe covers a screen or two.
+const WHEEL_STEP: f32 = 24.0;
+
+/// The 1-based cell at `position` in an extent holding `cells` cells.
+fn cell_at(position: f32, extent: f32, cells: u32) -> u32 {
+    if extent <= 0.0 || cells == 0 {
+        return 1;
+    }
+    let cell = (position.max(0.0) / extent * cells as f32).floor() as i64 + 1;
+    cell.clamp(1, cells as i64) as u32
+}
+
+/// One wheel notch in the encoding the program asked for, at a cell.
+fn wheel_event(encoding: MouseEncoding, up: bool, col: u32, row: u32) -> Option<Vec<u8>> {
+    let button = if up { 64 } else { 65 };
+    match encoding {
+        MouseEncoding::Off => None,
+        MouseEncoding::Sgr => Some(format!("\x1b[<{button};{col};{row}M").into_bytes()),
+        MouseEncoding::X10 => {
+            // X10's coordinates are single bytes, so they stay ASCII below
+            // 96. A program that never enabled SGR gets the right direction
+            // even when the finger is in the lower right.
+            let col = col.clamp(1, 95) as u8;
+            let row = row.clamp(1, 95) as u8;
+            Some(vec![0x1b, b'[', b'M', 32 + button, 32 + col, 32 + row])
+        }
+    }
+}
+
+/// A left press and release (a tap) in the encoding the program asked for,
+/// at a cell.
+fn click_event(encoding: MouseEncoding, col: u32, row: u32) -> Option<Vec<u8>> {
+    match encoding {
+        MouseEncoding::Off => None,
+        MouseEncoding::Sgr => {
+            Some(format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes())
+        }
+        MouseEncoding::X10 => {
+            // Button 3 is X10's release; coordinates stay one byte each.
+            let col = col.clamp(1, 95) as u8;
+            let row = row.clamp(1, 95) as u8;
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                32,
+                32 + col,
+                32 + row,
+                0x1b,
+                b'[',
+                b'M',
+                35,
+                32 + col,
+                32 + row,
+            ])
+        }
+    }
+}
+
+/// Sends wheel notches for `pending` points of travel, keeping the remainder
+/// under one step for the next event: a fast fling can move far between
+/// events, so one event's burst is capped.
+fn wheel_burst(session: &Session, encoding: MouseEncoding, pending: &mut f32, col: u32, row: u32) {
+    for _ in 0..6 {
+        if pending.abs() < WHEEL_STEP {
+            break;
+        }
+        let up = *pending > 0.0;
+        *pending -= if up { WHEEL_STEP } else { -WHEEL_STEP };
+        if let Some(bytes) = wheel_event(encoding, up, col, row) {
+            session.input_bytes(bytes);
+        }
+    }
+}
+
+/// A layer over a terminal whose program takes pointer events: vertical
+/// drags become wheel notches and a tap becomes a left click, both at the
+/// cell under the finger; a tap also takes the keyboard. It sits only over
+/// such a program, so elsewhere the terminal's own drag selects text and
+/// scrolls its scrollback.
+fn wheel_layer(
+    session: Session,
+    terminal_ref: ComponentRef<Terminal>,
+    mouse_mode: Signal<MouseEncoding>,
+    grid: Signal<(u32, u32)>,
+) -> impl IntoElement {
+    // The layer's size, for telling the program which cell a finger is on.
+    let area = signal((0.0f32, 0.0f32));
+    // A drag's travel not yet turned into wheel notches, and the cumulative
+    // travel of the last move event.
+    let carry = signal(0.0f32);
+    let last = signal(0.0f32);
+    let click_session = session.clone();
+    let wheel_session = session.clone();
+
+    let wheel_move = move |event: &ResponderEvent| {
+        // `delta` is the whole gesture so far, so only its step since the
+        // last event moves the wheel.
+        let delta = event.gesture.delta.y.0;
+        let step = delta - last.get_untracked();
+        last.set(delta);
+        let mut pending = carry.get_untracked() + step;
+        let (cols, rows) = grid.get_untracked();
+        let (width, height) = area.get_untracked();
+        let col = cell_at(event.location.x.0, width, cols);
+        let row = cell_at(event.location.y.0, height, rows);
+        wheel_burst(&session, mouse_mode.get_untracked(), &mut pending, col, row);
+        carry.set(pending);
+    };
+    let wheel_release = move |event: &ResponderEvent| {
+        let travel = event.gesture.delta;
+        // A tap clicks what is under it (a tab, a button); a drag has
+        // already scrolled and must not also click where it ends.
+        if travel.x.0.abs() < 6.0 && travel.y.0.abs() < 6.0 {
+            let (cols, rows) = grid.get_untracked();
+            let (width, height) = area.get_untracked();
+            let col = cell_at(event.location.x.0, width, cols);
+            let row = cell_at(event.location.y.0, height, rows);
+            if let Some(bytes) = click_event(mouse_mode.get_untracked(), col, row) {
+                click_session.input_bytes(bytes);
+            }
+            if let Some(api) = terminal_ref.api::<TerminalApi>() {
+                api.focus();
+            }
+        }
+        last.set(0.0);
+        carry.set(0.0);
+    };
+
+    view()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .on_layout(move |frame: &Bounds<Points>| {
+            area.set((frame.size.width.0, frame.size.height.0));
+        })
+        .claim_touches(TouchClaim::on_start())
+        .keep_touches(true)
+        // A screen reader reaches the terminal under it, not an empty layer.
+        .accessibility_elements_hidden(true)
+        .on_responder_grant(move |_: &ResponderEvent| {
+            last.set(0.0);
+            carry.set(0.0);
+        })
+        .on_responder_move(wheel_move)
+        .on_responder_release(wheel_release)
+        .on_responder_terminate(move |_: &ResponderEvent| {
+            last.set(0.0);
+            carry.set(0.0);
+        })
+        // A trackpad or a mouse wheel scrolls the program too, positive down
+        // as a browser reports it.
+        .on_wheel(move |event: &WheelEvent| {
+            let dy = match event.delta {
+                WheelDelta::Lines(lines) => lines.y * WHEEL_STEP,
+                WheelDelta::Points(points) => points.y.0,
+            };
+            let (cols, rows) = grid.get_untracked();
+            let (width, height) = area.get_untracked();
+            let col = cell_at(event.position.x.0, width, cols);
+            let row = cell_at(event.position.y.0, height, rows);
+            let mut pending = carry.get_untracked() - dy;
+            wheel_burst(
+                &wheel_session,
+                mouse_mode.get_untracked(),
+                &mut pending,
+                col,
+                row,
+            );
+            carry.set(pending);
+        })
+}
+
 fn terminal_page(config: ConnectionConfig, connected: Signal<bool>) -> impl IntoElement {
     let terminal_ref = component_ref::<Terminal>();
     let status = signal(Status::Connecting);
@@ -217,6 +494,14 @@ fn terminal_page(config: ConnectionConfig, connected: Signal<bool>) -> impl Into
     let agent_open = signal(std::env::var("KUMU_AUTO_AGENT").is_ok());
     let ctrl = signal(false);
     let alt = signal(false);
+    // Programs like OpenCode draw a full-screen TUI on the alternate screen,
+    // where a terminal keeps no scrollback. With pointer events on, a drag
+    // becomes a wheel notch for the program; without them, the key bar
+    // offers page keys for the program to scroll its own view.
+    let alt_screen = signal(false);
+    let mouse_mode = signal(MouseEncoding::Off);
+    // The terminal's grid, for telling the program which cell a drag is on.
+    let grid = signal((80u32, 24u32));
     let font_size = signal(
         Storage::get_item("font_size")
             .and_then(|value| value.parse::<f32>().ok())
@@ -237,17 +522,29 @@ fn terminal_page(config: ConnectionConfig, connected: Signal<bool>) -> impl Into
     // The socket runs on a background task; this one only feeds the native
     // terminal, so the UI thread never does network work.
     let mut stream = Utf8Stream::default();
+    let mut screen_mode = ScreenMode::default();
     let view_ref = terminal_ref;
     let credit_session = session.clone();
     spawn(async move {
         while let Some(feed) = output_rx.recv().await {
             match feed {
                 Feed::Reset => {
+                    let (alternate, mouse) = screen_mode.reset();
+                    if alternate {
+                        let _ = alt_screen.try_set(false);
+                    }
+                    if mouse != MouseEncoding::Off {
+                        let _ = mouse_mode.try_set(MouseEncoding::Off);
+                    }
                     if let Some(api) = view_ref.api::<TerminalApi>() {
                         api.reset();
                     }
                 }
                 Feed::Data(bytes) => {
+                    if let Some((alternate, mouse)) = screen_mode.push(&bytes) {
+                        let _ = alt_screen.try_set(alternate);
+                        let _ = mouse_mode.try_set(mouse);
+                    }
                     let consumed = bytes.len();
                     if let Some(text) = stream.push(&bytes)
                         && let Some(api) = view_ref.api::<TerminalApi>()
@@ -269,42 +566,56 @@ fn terminal_page(config: ConnectionConfig, connected: Signal<bool>) -> impl Into
     let show_session = session.clone();
     let close_session = session.clone();
     let agent_session = session.clone();
+    let wheel_session = session.clone();
     let focus_ref = terminal_ref;
 
     view()
         .flex_1()
         .child(header(title, status, sheet_open, menu_open))
         .child(
-            view().flex_1().bg(move || theme().background).child(
-                terminal()
-                    .component_ref(&terminal_ref)
-                    .scrollback(2_000u32)
-                    .font_size(move || px(font_size.get()))
-                    .line_height(move || px(font_size.get() * 1.4))
-                    .accessibility_label("终端")
-                    .on_data(move |data: &SharedString| {
-                        let (text, used_ctrl, used_alt) = apply_modifiers(
-                            data.to_string(),
-                            ctrl.get_untracked(),
-                            alt.get_untracked(),
-                        );
-                        if used_ctrl {
-                            ctrl.set(false);
-                        }
-                        if used_alt {
-                            alt.set(false);
-                        }
-                        input_session.input(text);
-                    })
-                    .on_resize(move |event: &TerminalEvent| {
-                        if let TerminalEvent::Resize(cols, rows) = event {
-                            resize_session.resize(*cols, *rows);
-                        }
-                    })
-                    .flex_1(),
-            ),
+            view()
+                .flex_1()
+                .bg(move || theme().background)
+                .child(
+                    terminal()
+                        .component_ref(&terminal_ref)
+                        .scrollback(2_000u32)
+                        .font_size(move || px(font_size.get()))
+                        .line_height(move || px(font_size.get() * 1.4))
+                        .accessibility_label("终端")
+                        .on_data(move |data: &SharedString| {
+                            let (text, used_ctrl, used_alt) = apply_modifiers(
+                                data.to_string(),
+                                ctrl.get_untracked(),
+                                alt.get_untracked(),
+                            );
+                            if used_ctrl {
+                                ctrl.set(false);
+                            }
+                            if used_alt {
+                                alt.set(false);
+                            }
+                            input_session.input(text);
+                        })
+                        .on_resize(move |event: &TerminalEvent| {
+                            if let TerminalEvent::Resize(cols, rows) = event {
+                                grid.set((*cols, *rows));
+                                resize_session.resize(*cols, *rows);
+                            }
+                        })
+                        .flex_1(),
+                )
+                // A program with mouse capture on scrolls on a wheel, which
+                // the phone lacks. Only then, a layer over the terminal turns
+                // vertical drags into wheel notches; a tap still takes the
+                // keyboard. Without mouse capture, drags reach the terminal
+                // and scroll its scrollback or select text.
+                .child(when(
+                    move || mouse_mode.get() != MouseEncoding::Off,
+                    move || wheel_layer(wheel_session.clone(), terminal_ref, mouse_mode, grid),
+                )),
         )
-        .child(key_bar(session, focus_ref, ctrl, alt))
+        .child(key_bar(session, focus_ref, ctrl, alt, alt_screen))
         .child(when(
             move || notice.get().is_some(),
             move || notice_overlay(notice),
@@ -503,8 +814,9 @@ fn notice_overlay(notice: Signal<Option<String>>) -> impl IntoElement {
         .right(px(0.0))
         .bottom(px(0.0))
         .px(px(12.0))
-        // Clear the key bar: two rows, their padding, and the home indicator.
-        .pb_keyboard_plus(px(132.0))
+        // Clear the key bar: up to three rows, their padding, and the home
+        // indicator.
+        .pb_keyboard_plus(px(170.0))
         .child(
             view()
                 .flex_row()
@@ -947,6 +1259,7 @@ fn key_bar(
     terminal_ref: ComponentRef<Terminal>,
     ctrl: Signal<bool>,
     alt: Signal<bool>,
+    alt_screen: Signal<bool>,
 ) -> impl IntoElement {
     view()
         .bg(move || theme().card)
@@ -985,10 +1298,15 @@ fn key_bar(
                                 .rounded(px(8.0))
                                 .bg(move || theme().primary)
                                 .active(|style| style.opacity(0.6))
+                                .accessibility_label("键盘")
+                                // SF Symbols' "keyboard", as a template icon:
+                                // NSH has no SF Symbol element, so the vector
+                                // is tinted like one.
                                 .child(
-                                    text("⌨")
-                                        .text_size(px(13.0))
-                                        .text_color(move || theme().primary_foreground),
+                                    image(asset!("keyboard.svg"))
+                                        .w(px(24.0))
+                                        .h(px(16.0))
+                                        .tint_color(move || theme().primary_foreground),
                                 ),
                         ),
                 )
@@ -1003,8 +1321,20 @@ fn key_bar(
                         .child(key_button("/", "/", session.clone()))
                         .child(key_button("-", "-", session.clone()))
                         .child(key_button("|", "|", session.clone()))
-                        .child(key_button("~", "~", session)),
-                ),
+                        .child(key_button("~", "~", session.clone())),
+                )
+                // A full-screen TUI scrolls its own messages; the terminal
+                // has no scrollback to drag. Page keys are what it listens to.
+                .child(when(
+                    move || alt_screen.get(),
+                    move || {
+                        view()
+                            .flex_row()
+                            .gap(px(6.0))
+                            .child(key_button("PgUp", "\u{1b}[5~", session.clone()))
+                            .child(key_button("PgDn", "\u{1b}[6~", session.clone()))
+                    },
+                )),
         )
 }
 
@@ -1091,7 +1421,10 @@ fn status_color(status: Status) -> Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrawerRow, PaneSummary, apply_modifiers, drawer_label, drawer_rows};
+    use super::{
+        DrawerRow, MouseEncoding, PaneSummary, ScreenMode, apply_modifiers, cell_at, click_event,
+        drawer_label, drawer_rows, wheel_event,
+    };
 
     fn pane(id: u64, project_id: i64, project: &str) -> PaneSummary {
         PaneSummary {
@@ -1147,6 +1480,87 @@ mod tests {
     fn a_project_without_a_name_reads_as_ungrouped() {
         assert_eq!(drawer_label(""), "未分组");
         assert_eq!(drawer_label("kumu"), "kumu");
+    }
+
+    #[test]
+    fn alternate_screen_switches_are_followed_across_chunks() {
+        let mut mode = ScreenMode::default();
+        assert_eq!(mode.push(b"\x1b[?104"), None);
+        assert_eq!(mode.push(b"9h"), Some((true, MouseEncoding::Off)));
+        assert_eq!(mode.push(b"plain output"), None);
+        assert_eq!(mode.push(b"\x1b[?1049l"), Some((false, MouseEncoding::Off)));
+    }
+
+    #[test]
+    fn mouse_capture_modes_follow_the_program() {
+        let mut mode = ScreenMode::default();
+        // OpenCode enables cell motion and SGR coordinates in one sequence.
+        assert_eq!(
+            mode.push(b"\x1b[?1049h\x1b[?1002;1006h"),
+            Some((true, MouseEncoding::Sgr))
+        );
+        assert_eq!(mode.push(b"\x1b[?1002l"), Some((true, MouseEncoding::Off)));
+        // X10 coordinates without 1006 still scroll.
+        let mut plain = ScreenMode::default();
+        assert_eq!(
+            plain.push(b"\x1b[?1049h\x1b[?1000h"),
+            Some((true, MouseEncoding::X10))
+        );
+        // Bracketed paste is not pointer tracking.
+        assert_eq!(mode.push(b"\x1b[?2004h"), None);
+    }
+
+    #[test]
+    fn reset_reports_and_clears_the_modes() {
+        let mut mode = ScreenMode::default();
+        assert_eq!(
+            mode.push(b"\x1b[?1049h\x1b[?1006;1002h"),
+            Some((true, MouseEncoding::Sgr))
+        );
+        assert_eq!(mode.reset(), (true, MouseEncoding::Sgr));
+        assert_eq!(mode.push(b""), None);
+    }
+
+    #[test]
+    fn a_wheel_notch_names_the_cell_under_the_finger() {
+        assert_eq!(cell_at(0.0, 390.0, 39), 1);
+        assert_eq!(cell_at(195.0, 390.0, 39), 20);
+        assert_eq!(cell_at(1000.0, 390.0, 39), 39);
+        assert_eq!(cell_at(10.0, 0.0, 0), 1);
+    }
+
+    #[test]
+    fn a_tap_is_a_left_press_and_release() {
+        assert_eq!(
+            click_event(MouseEncoding::Sgr, 20, 5),
+            Some(b"\x1b[<0;20;5M\x1b[<0;20;5m".to_vec())
+        );
+        // X10: button 0 down, button 3 release, cell 20,5.
+        assert_eq!(
+            click_event(MouseEncoding::X10, 20, 5),
+            Some(vec![
+                0x1b, b'[', b'M', 32, 52, 37, 0x1b, b'[', b'M', 35, 52, 37
+            ])
+        );
+        assert_eq!(click_event(MouseEncoding::Off, 1, 1), None);
+    }
+
+    #[test]
+    fn wheel_notches_use_the_program_encoding() {
+        assert_eq!(
+            wheel_event(MouseEncoding::Sgr, true, 20, 5),
+            Some(b"\x1b[<64;20;5M".to_vec())
+        );
+        assert_eq!(
+            wheel_event(MouseEncoding::Sgr, false, 20, 5),
+            Some(b"\x1b[<65;20;5M".to_vec())
+        );
+        // X10: button 64 up, cell 20,5 as one ASCII byte each.
+        assert_eq!(
+            wheel_event(MouseEncoding::X10, true, 20, 5),
+            Some(vec![0x1b, b'[', b'M', 96, 52, 37])
+        );
+        assert_eq!(wheel_event(MouseEncoding::Off, true, 1, 1), None);
     }
 
     #[test]

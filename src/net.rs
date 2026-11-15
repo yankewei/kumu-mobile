@@ -147,7 +147,12 @@ pub struct Session {
 
 impl Session {
     pub fn input(&self, data: impl Into<String>) {
-        let bytes = data.into().into_bytes();
+        self.input_bytes(data.into().into_bytes());
+    }
+
+    /// Sends raw bytes, for input the terminal protocol encodes itself (a
+    /// wheel event's legacy coordinates are not UTF-8).
+    pub fn input_bytes(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
             let _ = self.tx.send(Outgoing::Data(bytes));
         }
