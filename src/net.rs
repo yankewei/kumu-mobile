@@ -315,7 +315,23 @@ async fn run(
     let writer = tokio::spawn(async move {
         while let Some(outgoing) = rx.recv().await {
             let sent = match outgoing {
-                Outgoing::Close => break,
+                Outgoing::Close => {
+                    // Give the pane back before the stream ends: the Mac then
+                    // restores the desktop's grid now, rather than when it
+                    // notices the connection is gone.
+                    let channel = writer_channel.load(Ordering::Acquire);
+                    if channel != 0 {
+                        let detach = json!({
+                            "jsonrpc": "2.0",
+                            "id": 0,
+                            "method": "pane.detach",
+                            "params": {"channel": channel}
+                        })
+                        .to_string();
+                        let _ = write_message(&mut send, &Message::Text(detach)).await;
+                    }
+                    break;
+                }
                 Outgoing::Control(text) => write_message(&mut send, &Message::Text(text)).await,
                 Outgoing::Data(bytes) => {
                     let channel = writer_channel.load(Ordering::Acquire);
@@ -363,11 +379,12 @@ async fn run(
 
     // The Mac releases a disconnected phone's size lease after a quiet
     // period. A killed or suspended app sends nothing, so keep the session
-    // visibly alive while it is in the foreground.
+    // visibly alive while it is in the foreground; the Mac's timeout leaves
+    // room for a few lost pings.
     let ping_tx = tx.clone();
     let pinger = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             let ping = json!({"jsonrpc": "2.0", "id": 0, "method": "ping"}).to_string();
             if ping_tx.send(Outgoing::Control(ping)).is_err() {
                 break;

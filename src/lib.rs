@@ -12,6 +12,7 @@ use nsh_base::{
     MenuEvent, SheetEvent, Terminal, TerminalApi, TerminalEvent, alert_dialog, button, input, menu,
     menu_item, menu_separator, sheet, terminal, theme,
 };
+use nsh_core::platform::Lifecycle;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 
@@ -87,11 +88,22 @@ pub fn App() -> impl IntoElement {
         .bg(move || theme().background)
         .text_color(move || theme().foreground)
         .child(
+            // The Mac hands the pane's grid to the phone that attaches, so a
+            // session left open keeps the desktop at the phone's size. A
+            // suspended app can't say when it stopped looking: leaving the
+            // foreground drops the session (which gives the pane back at
+            // once) and coming back opens a new one with a fresh replay.
             when(
-                move || connected.get(),
+                move || connected.get() && lifecycle() != Lifecycle::Background,
                 move || terminal_page(config.get(), connected),
             )
-            .otherwise(move || connect_page(connected, config)),
+            .otherwise(move || {
+                when(
+                    move || connected.get(),
+                    move || connect_page(connected, config),
+                )
+                .otherwise(|| view().flex_1())
+            }),
         )
 }
 
@@ -518,6 +530,12 @@ fn terminal_page(config: ConnectionConfig, connected: Signal<bool>) -> impl Into
         agents,
         output_tx,
     );
+    // Leaving the page (background, disconnect) must end the session: the
+    // page's clones of its channels would otherwise keep the connection
+    // open, and the Mac would hold the phone's grid until its heartbeat
+    // expires.
+    let close_session = session.clone();
+    cleanup(move || close_session.close());
 
     // The socket runs on a background task; this one only feeds the native
     // terminal, so the UI thread never does network work.
